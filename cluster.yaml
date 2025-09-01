@@ -1,0 +1,27 @@
+apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
+
+metadata:
+  name: voting-eks-af-south-1
+  region: af-south-1
+  version: "1.29"   
+
+vpc:
+  cidr: 10.0.0.0/16
+
+managedNodeGroups:
+  - name: ng-voting
+    instanceType: t3.medium
+    desiredCapacity: 2
+    minSize: 2
+    maxSize: 4
+    volumeSize: 20
+    ssh:
+      allow: true
+      publicKeyName: ferdinando_accessKeys
+
+cloudWatch:
+  clusterLogging:
+    enableTypes: ["api", "audit", "authenticator", "controllerManager", "scheduler"]
+
+

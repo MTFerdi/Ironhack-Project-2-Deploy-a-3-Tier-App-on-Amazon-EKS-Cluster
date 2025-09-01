@@ -1,0 +1,78 @@
+name: CI/CD to EKS (af-south-1)
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  EKS_CLUSTER_NAME: ${{ secrets.EKS_CLUSTER_NAME }}
+  DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ----- Build & Push Images (vote, result, worker) -----
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build & push images
+        run: |
+          set -e
+          for svc in vote result worker; do
+            img="${DOCKERHUB_USERNAME}/${svc}:$GITHUB_SHA"
+            docker build -t "$img" "./app/${svc}"
+            docker push "$img"
+            echo "${svc}_IMAGE=$img" >> $GITHUB_ENV
+          done
+
+      # ----- Configure AWS & kubectl for EKS -----
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ secrets.AWS_REGION }}
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: 'latest'
+
+      - name: Update kubeconfig for EKS
+        run: aws eks update-kubeconfig --name "$EKS_CLUSTER_NAME" --region "$AWS_REGION"
+
+      # ----- Update manifests to use the new image tags & apply -----
+      - name: Patch images and apply manifests
+        run: |
+          set -e
+          # Patch Deployments to use the freshly built images
+          kubectl -n voting-app set image deploy/vote   vote=${{ env.vote_IMAGE }} --record=true
+          kubectl -n voting-app set image deploy/result result=${{ env.result_IMAGE }} --record=true
+          kubectl -n voting-app set image deploy/worker worker=${{ env.worker_IMAGE }} --record=true
+
+          # Apply base manifests (idempotent)
+          kubectl apply -f k8s/base/
+
+      - name: Wait for rollout
+        run: |
+          set -e
+          kubectl -n voting-app rollout status deploy/vote   --timeout=120s
+          kubectl -n voting-app rollout status deploy/result --timeout=120s
+          kubectl -n voting-app rollout status deploy/worker --timeout=120s
