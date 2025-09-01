@@ -13,16 +13,33 @@ env:
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
-
     permissions:
       id-token: write
       contents: read
+
+    outputs:
+      vote_image:   ${{ steps.tagout.outputs.vote_image }}
+      result_image: ${{ steps.tagout.outputs.result_image }}
+      worker_image: ${{ steps.tagout.outputs.worker_image }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # ----- Build & Push Images (vote, result, worker) -----
+      - name: Show repo tree (sanity)
+        run: |
+          set -euxo pipefail
+          ls -la
+          find app -maxdepth 2 -type f -print || true
+          find k8s -maxdepth 2 -type f -print || true
+
+      - name: Print tool versions
+        run: |
+          set -euxo pipefail
+          docker --version
+          aws --version || true
+
+      # ---------- Build & Push ----------
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -32,17 +49,33 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build & push images
+      - name: Compute image tags
+        id: tagout
         run: |
-          set -e
-          for svc in vote result worker; do
-            img="${DOCKERHUB_USERNAME}/${svc}:$GITHUB_SHA"
-            docker build -t "$img" "./app/${svc}"
-            docker push "$img"
-            echo "${svc}_IMAGE=$img" >> $GITHUB_ENV
-          done
+          set -euxo pipefail
+          echo "vote_image=${DOCKERHUB_USERNAME}/vote:${GITHUB_SHA}"       >> "$GITHUB_OUTPUT"
+          echo "result_image=${DOCKERHUB_USERNAME}/result:${GITHUB_SHA}"   >> "$GITHUB_OUTPUT"
+          echo "worker_image=${DOCKERHUB_USERNAME}/worker:${GITHUB_SHA}"   >> "$GITHUB_OUTPUT"
 
-      # ----- Configure AWS & kubectl for EKS -----
+      - name: Build & push vote
+        run: |
+          set -euxo pipefail
+          docker build -t "${{ steps.tagout.outputs.vote_image }}" ./app/vote
+          docker push    "${{ steps.tagout.outputs.vote_image }}"
+
+      - name: Build & push result
+        run: |
+          set -euxo pipefail
+          docker build -t "${{ steps.tagout.outputs.result_image }}" ./app/result
+          docker push    "${{ steps.tagout.outputs.result_image }}"
+
+      - name: Build & push worker
+        run: |
+          set -euxo pipefail
+          docker build -t "${{ steps.tagout.outputs.worker_image }}" ./app/worker
+          docker push    "${{ steps.tagout.outputs.worker_image }}"
+
+      # ---------- Configure kubectl ----------
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -55,24 +88,47 @@ jobs:
         with:
           version: 'latest'
 
-      - name: Update kubeconfig for EKS
-        run: aws eks update-kubeconfig --name "$EKS_CLUSTER_NAME" --region "$AWS_REGION"
-
-      # ----- Update manifests to use the new image tags & apply -----
-      - name: Patch images and apply manifests
+      - name: Update kubeconfig
         run: |
-          set -e
-          # Patch Deployments to use the freshly built images
-          kubectl -n voting-app set image deploy/vote   vote=${{ env.vote_IMAGE }} --record=true
-          kubectl -n voting-app set image deploy/result result=${{ env.result_IMAGE }} --record=true
-          kubectl -n voting-app set image deploy/worker worker=${{ env.worker_IMAGE }} --record=true
+          set -euxo pipefail
+          aws eks update-kubeconfig --name "$EKS_CLUSTER_NAME" --region "$AWS_REGION"
+          kubectl version --client=true
+          kubectl get ns
+          kubectl -n voting-app get deploy,svc || true
 
-          # Apply base manifests (idempotent)
+      # ---------- Patch images & apply ----------
+      - name: Show current images before patch
+        run: |
+          set -euxo pipefail
+          kubectl -n voting-app get deploy -o wide || true
+          for d in vote result worker; do
+            kubectl -n voting-app get deploy/$d -o=jsonpath='{.spec.template.spec.containers[0].image}'; echo || true
+          done
+
+      - name: Patch images to new tags
+        run: |
+          set -euxo pipefail
+          kubectl -n voting-app set image deploy/vote   vote=${{ steps.tagout.outputs.vote_image }}     --record=true
+          kubectl -n voting-app set image deploy/result result=${{ steps.tagout.outputs.result_image }} --record=true
+          kubectl -n voting-app set image deploy/worker worker=${{ steps.tagout.outputs.worker_image }} --record=true
+
+      - name: Apply base manifests (idempotent)
+        run: |
+          set -euxo pipefail
+          test -d k8s/base
           kubectl apply -f k8s/base/
 
       - name: Wait for rollout
         run: |
-          set -e
-          kubectl -n voting-app rollout status deploy/vote   --timeout=120s
-          kubectl -n voting-app rollout status deploy/result --timeout=120s
-          kubectl -n voting-app rollout status deploy/worker --timeout=120s
+          set -euxo pipefail
+          kubectl -n voting-app rollout status deploy/vote   --timeout=180s
+          kubectl -n voting-app rollout status deploy/result --timeout=180s
+          kubectl -n voting-app rollout status deploy/worker --timeout=180s
+
+      - name: Show images after rollout
+        run: |
+          set -euxo pipefail
+          for d in vote result worker; do
+            echo -n "$d -> "
+            kubectl -n voting-app get deploy/$d -o=jsonpath='{.spec.template.spec.containers[0].image}'; echo
+          done
